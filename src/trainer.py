@@ -9,20 +9,89 @@ from src.loss import vae_loss
 from src.model import VAE
 
 
+class EarlyStopping:
+    def __init__(
+        self, patience: int, min_delta: int = 0, mode: str = "min", model_signature=None
+    ) -> None:
+        self.patience = patience
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.model_signature = model_signature
+
+        match mode:
+            case "min":
+                self.monitor_op, self.delta_op = lambda a, b: a < b, -1 * min_delta
+            case "max":
+                self.monitor_op, self.delta_op = lambda a, b: a > b, min_delta
+            case _:
+                raise ValueError("mode must be either `min` or `max`")
+
+    def _log_best_model(self, model):
+        """helper function to log model."""
+        mlflow.pytorch.log_model(
+            model,
+            "best_model",
+            pip_requirements=["torch==2.2.1+cu121"],
+            signature=self.model_signature,
+        )
+
+    def step(self, metric_val, model):
+        # save the first chkpt
+        if self.best_score is None:
+            self.best_score = metric_val
+            self._log_best_model(model)
+            return
+        # save the subsequent chkpt
+        if self.monitor_op(metric_val, self.best_score + self.delta_op):
+            self.best_score = metric_val
+            self.counter = 0
+            self._log_best_model(model)
+            return
+        else:
+            self.counter += 1
+            if self.counter > self.patience:
+                self.early_stop = True
+            return
+
+    def __call__(self, val_loss):
+        if self.mode == "min":
+            if val_loss < self.best_score - self.min_delta:
+                self.best_score = val_loss
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+        elif self.mode == "max":
+            if val_loss > self.best_score + self.min_delta:
+                self.best_score = val_loss
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+        else:
+            raise ValueError("mode must be either min or max")
+
+
 class Trainer:
     def __init__(
         self,
         model: nn.Module,
         optimizer: Optimizer,
+        early_stopping: EarlyStopping | None,
         verbose_period: int,
         device: torch.device,
         transform=None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
+        self.early_stopping = early_stopping
         self.verbose_period = verbose_period
         self.device = device
         self.transform = transform
+        self.best_score = -float("inf")
 
     def fit(
         self,
@@ -35,6 +104,8 @@ class Trainer:
             self._train(train_loader, verbose, epoch)
             if valid_loader is not None:
                 self._valid(valid_loader, verbose, epoch)
+                if self.early_stopping and self.early_stopping.early_stop:
+                    break
 
     def evaluate(self, **kwarg):
         pass
@@ -51,11 +122,14 @@ class VAETrainer(Trainer):
         self,
         model: nn.Module,
         optimizer: Optimizer,
+        early_stopping: EarlyStopping | None,
         verbose_period: int,
         device: torch.device,
         transform=None,
     ) -> None:
-        super().__init__(model, optimizer, verbose_period, device, transform)
+        super().__init__(
+            model, optimizer, early_stopping, verbose_period, device, transform
+        )
 
     def _train(self, dataloader: DataLoader, verbose: bool, epoch_id: int):
         vae: VAE = self.model
@@ -83,9 +157,15 @@ class VAETrainer(Trainer):
         return
 
     def _valid(self, dataloader, verbose, epoch_id):
+        """
+        log all the metrics in mlflow;
+        return the metric for save-best/early-stop.
+        """
         if verbose:
             mse, kl = self.evaluate(dataloader, verbose, epoch_id)
             mlflow.log_metrics({"val_reconstr_loss": mse, "val_kl": kl}, step=epoch_id)
+        if self.early_stopping:
+            self.early_stopping.step(mse, self.model)
         return mse
 
     def evaluate(self, dataloader, verbose, epoch_id):
@@ -116,3 +196,26 @@ class VAETrainer(Trainer):
             print("val_recontr_loss={:.3f}, val_kl={:.3f}".format(mse, kl))
 
         return mse, kl
+
+
+def test_logging(
+    trainer: Trainer,
+    test_loader: DataLoader,
+    metric_names: list[str],
+    expr_name: str,
+    run_name: str,
+):
+    mlflow.set_experiment(expr_name)
+    run_data = mlflow.search_runs(filter_string=f"attributes.run_name = '{run_name}'")
+    if run_data.empty:
+        raise ValueError(f"run_name={run_name} does not exist")
+    else:
+        run_id = run_data.iloc[0].run_id
+        try:
+            with mlflow.start_run(run_id=run_id):
+                trainer.model = mlflow.pytorch.load_model(f"runs:/{run_id}/best_model")
+                test_scores = trainer.evaluate(test_loader, True, 0)
+                mlflow.log_metrics(metrics=dict(zip(metric_names, test_scores)), step=0)
+            print(f"Successfully added metrics to run {run_id}")
+        except Exception as e:
+            print(f"Error updating run: {e}")

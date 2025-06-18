@@ -163,7 +163,7 @@ class VAE(nn.Module):
         self.encoder = ResNet18Enc(z_dim=z_dim, nc=nc)
         self.decoder = ResNet18Dec(z_dim=z_dim, nc=nc)
 
-    def forward(self, x, eplicit=False):
+    def forward(self, x, explicit=False):
         mean, logvar = self.encoder(x)
         latent_params = {
             "mu": mean,
@@ -171,7 +171,7 @@ class VAE(nn.Module):
         }
         z = self.reparameterize(mean, logvar)
         x = self.decoder(z)
-        if eplicit:
+        if explicit:
             return x, latent_params, z
         else:
             return x, latent_params
