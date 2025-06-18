@@ -1,3 +1,6 @@
+"""Trainer classes & training infra functionalities integrated with MLflow."""
+
+from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -54,28 +57,8 @@ class EarlyStopping:
                 self.early_stop = True
             return
 
-    def __call__(self, val_loss):
-        if self.mode == "min":
-            if val_loss < self.best_score - self.min_delta:
-                self.best_score = val_loss
-                self.counter = 0
-            else:
-                self.counter += 1
-                if self.counter >= self.patience:
-                    self.early_stop = True
-        elif self.mode == "max":
-            if val_loss > self.best_score + self.min_delta:
-                self.best_score = val_loss
-                self.counter = 0
-            else:
-                self.counter += 1
-                if self.counter >= self.patience:
-                    self.early_stop = True
-        else:
-            raise ValueError("mode must be either min or max")
 
-
-class Trainer:
+class Trainer(ABC):
     def __init__(
         self,
         model: nn.Module,
@@ -107,12 +90,15 @@ class Trainer:
                 if self.early_stopping and self.early_stopping.early_stop:
                     break
 
+    @abstractmethod
     def evaluate(self, **kwarg):
         pass
 
+    @abstractmethod
     def _train(self, **kwarg):
         pass
 
+    @abstractmethod
     def _valid(self, **kwarg):
         pass
 
@@ -174,13 +160,13 @@ class VAETrainer(Trainer):
         device = self.device
 
         total_reconstr_loss, total_kl = 0.0, 0.0
+        num_batches = len(dataloader)
 
         with torch.no_grad():
             for batch in tqdm(
                 dataloader, disable=not verbose, desc=f"val-epoch {epoch_id}"
             ):
-                X, label = batch[0], batch[1].reshape(-1).long()
-                X, label = X.to(device), label.to(device)
+                X = batch[0].to(device)
                 if self.transform:
                     X = self.transform(X)
                 X_hat, latent_params = vae(X)
@@ -189,8 +175,8 @@ class VAETrainer(Trainer):
                 total_reconstr_loss += _recontr_loss
                 total_kl += _kl
 
-        mse = float(total_reconstr_loss / len(dataloader))
-        kl = float(total_kl / len(dataloader))
+        mse = float(total_reconstr_loss / num_batches)
+        kl = float(total_kl / num_batches)
 
         if verbose:
             print("val_recontr_loss={:.3f}, val_kl={:.3f}".format(mse, kl))
